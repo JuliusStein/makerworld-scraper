@@ -1,0 +1,6 @@
+.venv/
+makerworld_models.csv
+makerworld_models.json
+sample.csv
+sample.json
+__pycache__/
