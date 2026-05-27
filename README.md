@@ -1,6 +1,6 @@
 # MakerWorld Scraper
 
-Scrapes MakerWorld model metadata from the `trending` and `for_you` feeds, enriches each model with detail-page data, and writes the results to JSON and CSV.
+Scrapes MakerWorld model metadata from a fixed list of MakerWorld category root pages, enriches each model with detail-page data, and writes the results to JSON and CSV.
 
 Collected fields include:
 
@@ -39,15 +39,38 @@ Run the default scrape:
 .venv/bin/python scraper.py
 ```
 
-By default this fetches 100 pages each from:
+By default this fetches 100 pages from each category root:
 
-- `trending`
-- `for_you`
+- `art`
+- `fashion`
+- `hobby_diy`
+- `household`
+- `education`
+- `miniatures`
+- `tools`
+- `toys_games`
+- `3d_printer`
+- `props_cosplay`
+
+The category roots are:
+
+- `https://makerworld.com/en/3d-models/100-art`
+- `https://makerworld.com/en/3d-models/200-fashion`
+- `https://makerworld.com/en/3d-models/300-hobby-and-diy`
+- `https://makerworld.com/en/3d-models/400-household`
+- `https://makerworld.com/en/3d-models/500-education`
+- `https://makerworld.com/en/3d-models/600-miniatures`
+- `https://makerworld.com/en/3d-models/700-tools`
+- `https://makerworld.com/en/3d-models/800-toys-and-games`
+- `https://makerworld.com/en/3d-models/900-3d-printer`
+- `https://makerworld.com/en/3d-models/1000-props-and-cosplays`
 
 It writes:
 
 - `makerworld_models.json`
 - `makerworld_models.csv`
+
+The output files are rewritten after each completed feed page, so long runs still leave useful partial results if the process is interrupted later.
 
 ## Common Commands
 
@@ -57,16 +80,22 @@ Scrape a small sample:
 .venv/bin/python scraper.py --pages 1 --page-size 5
 ```
 
-Scrape only Trending:
+Scrape only Art:
 
 ```bash
-.venv/bin/python scraper.py --categories trending
+.venv/bin/python scraper.py --categories art
 ```
 
-Scrape only For You:
+Scrape a few specific categories:
 
 ```bash
-.venv/bin/python scraper.py --categories for_you
+.venv/bin/python scraper.py --categories household tools toys_games
+```
+
+Quoted category names also work:
+
+```bash
+.venv/bin/python scraper.py --categories "3D Printer" "Props & Cosplay"
 ```
 
 Write custom output files:
@@ -98,7 +127,7 @@ Slow down requests:
 ```text
 --pages              Feed pages to fetch per category. Default: 100.
 --page-size          Models requested per feed page. Default: 20.
---categories         Categories to scrape: trending, for_you.
+--categories         Category roots to scrape. Default: all configured category roots.
 --output             JSON output path. Default: makerworld_models.json.
 --csv-output         CSV output path. Default: makerworld_models.csv.
 --delay              Delay between HTTP requests in seconds. Default: 0.25.
@@ -119,8 +148,12 @@ The `color_detection_method` field explains which path was used:
 
 - `photo_analysis`
 - `photo_analysis_profile_calibrated`
+- `image_analysis_failed`
+- `no_images`
 - `print_profile_fallback`
 - `none`
+
+When image analysis is enabled and there is no image to analyze, the color classification is written as `unknown`. Image-analysis errors are logged as warnings and also produce `unknown` instead of stopping the scrape.
 
 ## Notes
 

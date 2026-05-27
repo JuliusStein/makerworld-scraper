@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Scrape MakerWorld model metadata from the Trending and For You feeds.
+Scrape MakerWorld model metadata from the 3D Models sidebar categories.
 
 The script uses MakerWorld/Bambu's public JSON endpoints, then enriches each
 model with the detail endpoint so descriptions and print-profile colors are
@@ -10,10 +10,12 @@ available. Photo color classification uses Pillow when installed.
 from __future__ import annotations
 
 import argparse
+import colorsys
 import csv
 import io
 import json
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -28,6 +30,18 @@ from typing import Any, Iterable
 
 API_BASE = "https://api.bambulab.com/v1"
 MAKERWORLD_BASE = "https://makerworld.com/en/models"
+CATEGORY_ROOTS = {
+    "art": {"display": "Art", "url": "https://makerworld.com/en/3d-models/100-art"},
+    "fashion": {"display": "Fashion", "url": "https://makerworld.com/en/3d-models/200-fashion"},
+    "hobby_diy": {"display": "Hobby & DIY", "url": "https://makerworld.com/en/3d-models/300-hobby-and-diy"},
+    "household": {"display": "Household", "url": "https://makerworld.com/en/3d-models/400-household"},
+    "education": {"display": "Education", "url": "https://makerworld.com/en/3d-models/500-education"},
+    "miniatures": {"display": "Miniatures", "url": "https://makerworld.com/en/3d-models/600-miniatures"},
+    "tools": {"display": "Tools", "url": "https://makerworld.com/en/3d-models/700-tools"},
+    "toys_games": {"display": "Toys & Games", "url": "https://makerworld.com/en/3d-models/800-toys-and-games"},
+    "3d_printer": {"display": "3D Printer", "url": "https://makerworld.com/en/3d-models/900-3d-printer"},
+    "props_cosplay": {"display": "Props & Cosplays", "url": "https://makerworld.com/en/3d-models/1000-props-and-cosplays"},
+}
 DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -84,7 +98,13 @@ def http_json(url: str, delay: float = 0.0) -> Any:
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:500]
         raise RuntimeError(f"HTTP {exc.code} for {url}: {body}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"Timed out fetching {url}") from exc
+    except socket.timeout as exc:
+        raise RuntimeError(f"Timed out fetching {url}") from exc
     except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise RuntimeError(f"Timed out fetching {url}") from exc
         raise RuntimeError(f"Failed to fetch {url}: {exc}") from exc
 
 
@@ -95,7 +115,13 @@ def http_bytes(url: str, delay: float = 0.0) -> bytes:
     try:
         with urllib.request.urlopen(request, timeout=45) as response:
             return response.read()
+    except TimeoutError as exc:
+        raise RuntimeError(f"Timed out fetching image {url}") from exc
+    except socket.timeout as exc:
+        raise RuntimeError(f"Timed out fetching image {url}") from exc
     except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
+            raise RuntimeError(f"Timed out fetching image {url}") from exc
         raise RuntimeError(f"Failed to fetch image {url}: {exc}") from exc
 
 
@@ -108,14 +134,20 @@ def clean_html(html: str | None) -> str:
     return re.sub(r"\s+", " ", parser.get_text()).strip()
 
 
-def endpoint_for_category(category: str, page: int, page_size: int, seed: int) -> str:
+def category_nav_key(category: str) -> str:
+    root_url = CATEGORY_ROOTS[category]["url"]
+    path_part = urllib.parse.urlparse(root_url).path.rstrip("/").split("/")[-1]
+    match = re.match(r"(\d+)-", path_part)
+    if not match:
+        raise ValueError(f"Category URL does not contain a numeric category id: {root_url}")
+    return f"category_{match.group(1)}"
+
+
+def endpoint_for_category(category: str, page: int, page_size: int) -> str:
     offset = (page - 1) * page_size
-    if category == "trending":
-        params = {"navKey": "Trending", "offset": offset, "limit": page_size}
+    if category in CATEGORY_ROOTS:
+        params = {"navKey": category_nav_key(category), "offset": offset, "limit": page_size}
         return f"{API_BASE}/search-service/select/design/nav?{urllib.parse.urlencode(params)}"
-    if category == "for_you":
-        params = {"limit": page_size, "offset": offset, "seed": seed, "acceptTypes": "0"}
-        return f"{API_BASE}/design-recommend-service/my/for-you?{urllib.parse.urlencode(params)}"
     raise ValueError(f"Unsupported category: {category}")
 
 
@@ -129,12 +161,10 @@ def normalize_feed_item(item: dict[str, Any]) -> dict[str, Any] | None:
     return item
 
 
-def fetch_feed_page(category: str, page: int, page_size: int, seed: int, delay: float) -> tuple[list[dict[str, Any]], int]:
-    payload = http_json(endpoint_for_category(category, page, page_size, seed), delay=delay)
+def fetch_feed_page(category: str, page: int, page_size: int, delay: float) -> list[dict[str, Any]]:
+    payload = http_json(endpoint_for_category(category, page, page_size), delay=delay)
     hits = payload.get("hits", []) if isinstance(payload, dict) else []
-    next_seed = int(payload.get("seed") or seed) if isinstance(payload, dict) else seed
-    models = [model for item in hits if (model := normalize_feed_item(item))]
-    return models, next_seed
+    return [model for item in hits if (model := normalize_feed_item(item))]
 
 
 def fetch_design_detail(design_id: int, delay: float) -> dict[str, Any]:
@@ -238,6 +268,25 @@ def looks_like_neutral_gradient(colors: list[str]) -> bool:
     return max(brightnesses) - min(brightnesses) <= 0.65
 
 
+def looks_like_single_hue_shading(colors: list[str]) -> bool:
+    if len(colors) <= 1:
+        return False
+    hue_values: list[float] = []
+    for color in colors:
+        r, g, b = hex_to_rgb(color)
+        hue, saturation, _ = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        if saturation < 0.12:
+            continue
+        hue_values.append(hue)
+    if len(hue_values) <= 1:
+        return True
+    hue_values.sort()
+    gaps = [hue_values[index + 1] - hue_values[index] for index in range(len(hue_values) - 1)]
+    gaps.append(1 + hue_values[0] - hue_values[-1])
+    circular_range = 1 - max(gaps)
+    return circular_range <= 0.08
+
+
 def merge_close_colors(colors: list[tuple[str, int]]) -> list[str]:
     merged: list[tuple[tuple[int, int, int], int]] = []
     for hex_color, count in colors:
@@ -255,6 +304,124 @@ def merge_close_colors(colors: list[tuple[str, int]]) -> list[str]:
     return ["#{:02X}{:02X}{:02X}".format(*rgb) for rgb, _ in merged]
 
 
+def merge_close_color_counts(colors: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    merged: list[tuple[tuple[int, int, int], int]] = []
+    for hex_color, count in colors:
+        rgb = hex_to_rgb(hex_color)
+        for index, (existing, existing_count) in enumerate(merged):
+            if color_distance(rgb, existing) < 75:
+                weight = existing_count + count
+                averaged = tuple(int((existing[i] * existing_count + rgb[i] * count) / weight) for i in range(3))
+                merged[index] = (averaged, weight)
+                break
+        else:
+            merged.append((rgb, count))
+
+    merged.sort(key=lambda item: item[1], reverse=True)
+    return [("#{:02X}{:02X}{:02X}".format(*rgb), count) for rgb, count in merged]
+
+
+def border_background_colors(pixels: list[tuple[int, int, int, int]], width: int, height: int) -> list[tuple[int, int, int]]:
+    buckets: dict[str, int] = {}
+    border = max(2, min(width, height) // 20)
+    for y in range(height):
+        for x in range(width):
+            if x >= border and x < width - border and y >= border and y < height - border:
+                continue
+            r, g, b, alpha = pixels[y * width + x]
+            if alpha < 20:
+                continue
+            color = quantized_hex((r, g, b))
+            buckets[color] = buckets.get(color, 0) + 1
+
+    if not buckets:
+        return []
+    dominant = sorted(buckets.items(), key=lambda item: item[1], reverse=True)[:4]
+    return [hex_to_rgb(color) for color, _ in dominant]
+
+
+def build_foreground_mask(
+    pixels: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+    backgrounds: list[tuple[int, int, int]],
+) -> list[bool]:
+    mask: list[bool] = []
+    for index, pixel in enumerate(pixels):
+        x = index % width
+        y = index // width
+        r, g, b, alpha = pixel
+        if alpha < 20:
+            mask.append(False)
+            continue
+        if x < width * 0.04 or x > width * 0.96 or y < height * 0.04 or y > height * 0.96:
+            mask.append(False)
+            continue
+        rgb = (r, g, b)
+        if backgrounds and min(color_distance(rgb, background) for background in backgrounds) < 55:
+            mask.append(False)
+            continue
+        mask.append(True)
+    return mask
+
+
+def component_score(component: list[int], width: int, height: int) -> float:
+    center_x = (width - 1) / 2
+    center_y = (height - 1) / 2
+    xs = [index % width for index in component]
+    ys = [index // width for index in component]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    component_center_x = (min_x + max_x) / 2
+    component_center_y = (min_y + max_y) / 2
+    distance = ((component_center_x - center_x) ** 2 + (component_center_y - center_y) ** 2) ** 0.5
+    center_bonus = 0
+    for index in component:
+        x = index % width
+        y = index // width
+        if width * 0.35 <= x <= width * 0.65 and height * 0.35 <= y <= height * 0.65:
+            center_bonus += 1
+    return len(component) + center_bonus * 2 - distance * 8
+
+
+def select_printed_object_mask(mask: list[bool], width: int, height: int) -> set[int]:
+    visited = [False] * len(mask)
+    components: list[list[int]] = []
+    min_area = max(20, int(width * height * 0.004))
+
+    for start, is_foreground in enumerate(mask):
+        if visited[start] or not is_foreground:
+            continue
+        stack = [start]
+        visited[start] = True
+        component: list[int] = []
+        while stack:
+            index = stack.pop()
+            component.append(index)
+            x = index % width
+            y = index // width
+            neighbors = []
+            if x > 0:
+                neighbors.append(index - 1)
+            if x < width - 1:
+                neighbors.append(index + 1)
+            if y > 0:
+                neighbors.append(index - width)
+            if y < height - 1:
+                neighbors.append(index + width)
+            for neighbor in neighbors:
+                if not visited[neighbor] and mask[neighbor]:
+                    visited[neighbor] = True
+                    stack.append(neighbor)
+        if len(component) >= min_area:
+            components.append(component)
+
+    if not components:
+        return set()
+    chosen = max(components, key=lambda component: component_score(component, width, height))
+    return set(chosen)
+
+
 def analyze_image_colors(image_data: bytes, sample_size: int = 180) -> list[str]:
     try:
         from PIL import Image
@@ -262,47 +429,42 @@ def analyze_image_colors(image_data: bytes, sample_size: int = 180) -> list[str]
         raise RuntimeError("Pillow is required for image analysis. Install with: pip install -r requirements.txt") from exc
 
     with Image.open(io.BytesIO(image_data)) as image:
-        image = image.convert("RGB")
+        image = image.convert("RGBA")
         image.thumbnail((sample_size, sample_size))
         width, height = image.size
         pixel_source = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
         pixels = list(pixel_source)
 
-    # Estimate a background color from corners, then focus on central, non-background pixels.
-    corner_points = [
-        (0, 0),
-        (max(width - 1, 0), 0),
-        (0, max(height - 1, 0)),
-        (max(width - 1, 0), max(height - 1, 0)),
-    ]
-    corner_pixels = [pixels[y * width + x] for x, y in corner_points]
-    background = tuple(int(sum(pixel[i] for pixel in corner_pixels) / len(corner_pixels)) for i in range(3))
+    backgrounds = border_background_colors(pixels, width, height)
+    object_mask = select_printed_object_mask(build_foreground_mask(pixels, width, height, backgrounds), width, height)
+    if not object_mask:
+        return []
 
     buckets: dict[str, int] = {}
-    for y in range(height):
-        for x in range(width):
-            # Gallery photos usually center the print; trim the outer frame first.
-            if x < width * 0.08 or x > width * 0.92 or y < height * 0.08 or y > height * 0.92:
-                continue
-            rgb = pixels[y * width + x]
-            if color_distance(rgb, background) < 45:
-                continue
-            max_c, min_c = max(rgb), min(rgb)
-            saturation = 0 if max_c == 0 else (max_c - min_c) / max_c
-            brightness = max_c / 255
-            if brightness > 0.92 and saturation < 0.12:
-                continue
-            if brightness < 0.08:
-                continue
-            buckets[quantized_hex(rgb)] = buckets.get(quantized_hex(rgb), 0) + 1
+    for index in object_mask:
+        r, g, b, _ = pixels[index]
+        rgb = (r, g, b)
+        buckets[quantized_hex(rgb)] = buckets.get(quantized_hex(rgb), 0) + 1
 
     if not buckets:
         return []
 
     total = sum(buckets.values())
-    significant = [(color, count) for color, count in buckets.items() if count / total >= 0.035]
-    significant.sort(key=lambda item: item[1], reverse=True)
-    return merge_close_colors(significant[:8])[:5]
+    significant = [(color, count) for color, count in buckets.items() if count / total >= 0.025]
+    merged = merge_close_color_counts(sorted(significant, key=lambda item: item[1], reverse=True)[:10])
+    if not merged:
+        return []
+
+    filtered = [(color, count) for color, count in merged if count / total >= 0.10]
+    if not filtered:
+        filtered = [merged[0]]
+    if len(filtered) > 1:
+        top_count = filtered[0][1]
+        filtered = [item for item in filtered if item[1] / top_count >= 0.28]
+    colors = [color for color, _ in filtered[:4]]
+    if looks_like_neutral_gradient(colors) or looks_like_single_hue_shading(colors):
+        return [colors[0]]
+    return colors
 
 
 def classify_colors(
@@ -313,29 +475,28 @@ def classify_colors(
     analyze_photos: bool,
 ) -> tuple[str, int, list[str], str]:
     if analyze_photos:
+        if not image_urls[:image_limit]:
+            return "unknown", 0, [], "no_images"
+
         photo_colors: list[str] = []
         failures = 0
         for url in image_urls[:image_limit]:
             try:
-                for color in analyze_image_colors(http_bytes(url, delay=delay)):
-                    if color not in photo_colors:
-                        photo_colors.append(color)
-            except RuntimeError as exc:
+                photo_colors = analyze_image_colors(http_bytes(url, delay=delay))
+                if photo_colors:
+                    break
+            except Exception as exc:
                 failures += 1
-                if "Pillow is required" in str(exc):
-                    raise
+                print(f"Warning: image analysis failed for {url}: {exc}", file=sys.stderr)
                 continue
         if photo_colors:
             if len(profile_colors) == 1 and looks_like_neutral_gradient(photo_colors):
                 return "single color", 1, [profile_colors[0]], "photo_analysis_profile_calibrated"
-            if len(profile_colors) > len(photo_colors):
-                label = "multi color" if len(profile_colors) > 1 else "single color"
-                return label, len(profile_colors), profile_colors, "print_profile_fallback"
             count = len(photo_colors)
             label = "multi color" if count > 1 else "single color"
             return label, count, photo_colors, "photo_analysis"
         if failures:
-            print(f"Warning: image analysis failed for {failures} image(s); using profile colors.", file=sys.stderr)
+            return "unknown", 0, [], "image_analysis_failed"
 
     if profile_colors:
         count = len(profile_colors)
@@ -354,6 +515,7 @@ def build_record(
     args: argparse.Namespace,
 ) -> ModelRecord:
     design_id = int(detail.get("id") or model["id"])
+    category_display = CATEGORY_ROOTS[category]["display"]
     images = image_urls_from_model(model, detail)
     profile_colors = collect_profile_colors(detail)
     color_label, color_count, colors, method = classify_colors(
@@ -365,7 +527,7 @@ def build_record(
     )
     creator = detail.get("designCreator") or model.get("designCreator") or {}
     return ModelRecord(
-        source_category=category,
+        source_category=category_display,
         source_page=page,
         source_rank=rank,
         id=design_id,
@@ -402,23 +564,64 @@ def write_csv(records: Iterable[ModelRecord], path: Path) -> None:
         writer.writerows(rows)
 
 
+def write_outputs(records: Iterable[ModelRecord], json_path: Path, csv_path: Path) -> None:
+    write_json(records, json_path)
+    write_csv(records, csv_path)
+
+
+def normalize_category(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = normalized.replace("&", "and")
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    aliases = {
+        "3d_printer": "3d_printer",
+        "3d_printers": "3d_printer",
+        "printer": "3d_printer",
+        "art": "art",
+        "education": "education",
+        "fashion": "fashion",
+        "hobby_diy": "hobby_diy",
+        "hobby_and_diy": "hobby_diy",
+        "diy": "hobby_diy",
+        "household": "household",
+        "miniatures": "miniatures",
+        "props_cosplay": "props_cosplay",
+        "props_and_cosplay": "props_cosplay",
+        "props_cosplays": "props_cosplay",
+        "props_and_cosplays": "props_cosplay",
+        "cosplay": "props_cosplay",
+        "tools": "tools",
+        "toys_games": "toys_games",
+        "toys_and_games": "toys_games",
+        "toys": "toys_games",
+        "games": "toys_games",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        valid = ", ".join(CATEGORY_ROOTS)
+        raise argparse.ArgumentTypeError(f"Unknown category '{value}'. Use one of: {valid}") from exc
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scrape MakerWorld trending and for-you model metadata.")
+    parser = argparse.ArgumentParser(description="Scrape MakerWorld category root model metadata.")
     parser.add_argument("--pages", type=int, default=100, help="Feed pages to fetch per category. Default: 100.")
     parser.add_argument("--page-size", type=int, default=20, help="Models requested per feed page. Default: 20.")
     parser.add_argument(
         "--categories",
         nargs="+",
-        choices=["trending", "for_you"],
-        default=["trending", "for_you"],
-        help="Categories to scrape. Default: trending for_you.",
+        type=normalize_category,
+        default=list(CATEGORY_ROOTS),
+        help=(
+            "Category roots to scrape. Default: all configured category roots. "
+            "Examples: art household toys_games 'Props & Cosplay'."
+        ),
     )
     parser.add_argument("--output", default="makerworld_models.json", help="JSON output path.")
     parser.add_argument("--csv-output", default="makerworld_models.csv", help="CSV output path.")
     parser.add_argument("--delay", type=float, default=0.25, help="Delay between HTTP requests in seconds. Default: 0.25.")
     parser.add_argument("--image-limit", type=int, default=3, help="Images to analyze per model. Default: 3.")
     parser.add_argument("--no-image-analysis", action="store_true", help="Skip photo analysis and use print profile colors only.")
-    parser.add_argument("--seed", type=int, default=0, help="Initial For You seed. Default: 0.")
     return parser.parse_args()
 
 
@@ -426,25 +629,39 @@ def main() -> int:
     args = parse_args()
     records: list[ModelRecord] = []
     seen_by_category: set[tuple[str, int]] = set()
-    seed = args.seed
+    json_path = Path(args.output)
+    csv_path = Path(args.csv_output)
 
     try:
         for category in args.categories:
+            category_display = CATEGORY_ROOTS[category]["display"]
             for page in range(1, args.pages + 1):
-                models, seed = fetch_feed_page(category, page, args.page_size, seed, delay=args.delay)
-                if not models:
-                    print(f"{category} page {page}: no models returned; stopping this category.", file=sys.stderr)
+                try:
+                    models = fetch_feed_page(category, page, args.page_size, delay=args.delay)
+                except RuntimeError as exc:
+                    print(f"Warning: failed to fetch {category_display} page {page}: {exc}", file=sys.stderr)
+                    write_outputs(records, json_path, csv_path)
+                    print(f"Wrote {len(records)} records to {args.output} and {args.csv_output}", file=sys.stderr)
                     break
-                print(f"{category} page {page}: {len(models)} models", file=sys.stderr)
+                if not models:
+                    print(f"{category_display} page {page}: no models returned; stopping this category.", file=sys.stderr)
+                    break
+                print(f"{category_display} page {page}: {len(models)} models", file=sys.stderr)
                 for index, model in enumerate(models, start=1):
                     design_id = int(model["id"])
                     key = (category, design_id)
                     if key in seen_by_category:
                         continue
                     seen_by_category.add(key)
-                    detail = fetch_design_detail(design_id, delay=args.delay)
-                    record = build_record(category, page, index, model, detail, args)
+                    try:
+                        detail = fetch_design_detail(design_id, delay=args.delay)
+                        record = build_record(category, page, index, model, detail, args)
+                    except RuntimeError as exc:
+                        print(f"Warning: skipped model {design_id}: {exc}", file=sys.stderr)
+                        continue
                     records.append(record)
+                write_outputs(records, json_path, csv_path)
+                print(f"Wrote {len(records)} records to {args.output} and {args.csv_output}", file=sys.stderr)
     except KeyboardInterrupt:
         print("Interrupted; writing records collected so far.", file=sys.stderr)
     except RuntimeError as exc:
@@ -454,9 +671,8 @@ def main() -> int:
         else:
             return 1
 
-    write_json(records, Path(args.output))
-    write_csv(records, Path(args.csv_output))
-    print(f"Wrote {len(records)} records to {args.output} and {args.csv_output}", file=sys.stderr)
+    write_outputs(records, json_path, csv_path)
+    print(f"Finished with {len(records)} records in {args.output} and {args.csv_output}", file=sys.stderr)
     return 0
 
 
