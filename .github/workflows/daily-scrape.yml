@@ -14,6 +14,9 @@ on:
         required: false
         default: "20"
 
+permissions:
+  contents: write
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -39,9 +42,14 @@ jobs:
             --pages "${{ github.event.inputs.pages || '100' }}" \
             --page-size "${{ github.event.inputs.page_size || '20' }}"
 
-      - name: Upload dated scrape outputs
-        uses: actions/upload-artifact@v4
-        with:
-          name: makerworld-data-${{ github.run_id }}
-          path: data/makerworld_models_*.*
-          retention-days: 90
+      - name: Commit and push dated scrape outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/makerworld_models_*.csv data/makerworld_models_*.json
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+            exit 0
+          fi
+          git commit -m "Add MakerWorld scrape for $(date -u +%F)"
+          git push

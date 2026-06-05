@@ -132,12 +132,14 @@ python scraper.py --no-image-analysis --pages 100 --page-size 20
 
 The workflow runs at `08:15 UTC` every day and can also be started manually from the GitHub Actions tab with custom `pages` and `page_size` inputs.
 
-Daily outputs are uploaded as workflow artifacts named `makerworld-data-<run_id>` and retained for 90 days. The artifact contains the dated files from `data/`, such as:
+Daily outputs are committed back into the repository under `data/`, such as:
 
 - `data/makerworld_models_YYYY-MM-DD.json`
 - `data/makerworld_models_YYYY-MM-DD.csv`
 
-This avoids committing large scrape outputs into git history while still preserving daily snapshots in GitHub Actions.
+The workflow uses the default `GITHUB_TOKEN` with `contents: write` permission to commit and push the generated files. In the GitHub repository settings, make sure **Actions > General > Workflow permissions** allows read and write permissions.
+
+Because this stores scrape outputs in git history, the repository can grow over time. If that becomes a problem, switch back to artifacts or move the data to object storage.
 
 ## CLI Options
 
