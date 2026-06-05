@@ -67,8 +67,8 @@ The category roots are:
 
 It writes:
 
-- `makerworld_models.json`
-- `makerworld_models.csv`
+- `data/makerworld_models_YYYY-MM-DD.json`
+- `data/makerworld_models_YYYY-MM-DD.csv`
 
 The output files are rewritten after each completed feed page, so long runs still leave useful partial results if the process is interrupted later.
 
@@ -122,18 +122,34 @@ Slow down requests:
 .venv/bin/python scraper.py --delay 0.5
 ```
 
+## Daily GitHub Actions Run
+
+The repository includes `.github/workflows/daily-scrape.yml`, which runs the scraper once per day with image analysis disabled:
+
+```bash
+python scraper.py --no-image-analysis --pages 100 --page-size 20
+```
+
+The workflow runs at `08:15 UTC` every day and can also be started manually from the GitHub Actions tab with custom `pages` and `page_size` inputs.
+
+Daily outputs are uploaded as workflow artifacts named `makerworld-data-<run_id>` and retained for 90 days. The artifact contains the dated files from `data/`, such as:
+
+- `data/makerworld_models_YYYY-MM-DD.json`
+- `data/makerworld_models_YYYY-MM-DD.csv`
+
+This avoids committing large scrape outputs into git history while still preserving daily snapshots in GitHub Actions.
+
 ## CLI Options
 
 ```text
 --pages              Feed pages to fetch per category. Default: 100.
 --page-size          Models requested per feed page. Default: 20.
 --categories         Category roots to scrape. Default: all configured category roots.
---output             JSON output path. Default: makerworld_models.json.
---csv-output         CSV output path. Default: makerworld_models.csv.
+--output             JSON output path. Default: data/makerworld_models_YYYY-MM-DD.json.
+--csv-output         CSV output path. Default: data/makerworld_models_YYYY-MM-DD.csv.
 --delay              Delay between HTTP requests in seconds. Default: 0.25.
 --image-limit        Images to analyze per model. Default: 3.
 --no-image-analysis  Skip photo analysis and use print profile colors only.
---seed               Initial For You feed seed. Default: 0.
 ```
 
 ## Color Classification

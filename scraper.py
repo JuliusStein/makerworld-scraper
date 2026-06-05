@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import date
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -284,7 +285,54 @@ def looks_like_single_hue_shading(colors: list[str]) -> bool:
     gaps = [hue_values[index + 1] - hue_values[index] for index in range(len(hue_values) - 1)]
     gaps.append(1 + hue_values[0] - hue_values[-1])
     circular_range = 1 - max(gaps)
-    return circular_range <= 0.08
+    max_distance = 0.0
+    for index, color in enumerate(colors):
+        for other in colors[index + 1 :]:
+            max_distance = max(max_distance, color_distance(hex_to_rgb(color), hex_to_rgb(other)))
+    if circular_range <= 0.03:
+        return True
+    return circular_range <= 0.045 and max_distance <= 95
+
+
+def hsv_for_rgb(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
+    r, g, b = rgb
+    return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+
+
+def hue_distance(a: float, b: float) -> float:
+    diff = abs(a - b)
+    return min(diff, 1 - diff)
+
+
+def same_filament_tone(a: tuple[int, int, int], b: tuple[int, int, int]) -> bool:
+    ah, asat, aval = hsv_for_rgb(a)
+    bh, bsat, bval = hsv_for_rgb(b)
+    if asat < 0.16 and bsat < 0.16 and abs(aval - bval) <= 0.28:
+        return True
+    if aval < 0.35 and bval < 0.35 and asat < 0.32 and bsat < 0.32:
+        return True
+    if asat >= 0.16 and bsat >= 0.16 and hue_distance(ah, bh) <= 0.055 and abs(asat - bsat) <= 0.32:
+        return True
+    if color_distance(a, b) <= 70:
+        return True
+    return False
+
+
+def colors_are_muted_shading(colors: list[str]) -> bool:
+    if len(colors) <= 1:
+        return False
+    stats = [hsv_for_rgb(hex_to_rgb(color)) for color in colors]
+    return all(saturation <= 0.34 or value <= 0.35 for _, saturation, value in stats)
+
+
+def is_high_contrast_neutral_pair(a: tuple[int, int, int], b: tuple[int, int, int]) -> bool:
+    _, asat, aval = hsv_for_rgb(a)
+    _, bsat, bval = hsv_for_rgb(b)
+    return asat < 0.22 and bsat < 0.22 and abs(aval - bval) >= 0.45
+
+
+def representative_hex(rgb: tuple[int, int, int]) -> str:
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
 
 
 def merge_close_colors(colors: list[tuple[str, int]]) -> list[str]:
@@ -309,7 +357,7 @@ def merge_close_color_counts(colors: list[tuple[str, int]]) -> list[tuple[str, i
     for hex_color, count in colors:
         rgb = hex_to_rgb(hex_color)
         for index, (existing, existing_count) in enumerate(merged):
-            if color_distance(rgb, existing) < 75:
+            if color_distance(rgb, existing) < 55:
                 weight = existing_count + count
                 averaged = tuple(int((existing[i] * existing_count + rgb[i] * count) / weight) for i in range(3))
                 merged[index] = (averaged, weight)
@@ -319,6 +367,22 @@ def merge_close_color_counts(colors: list[tuple[str, int]]) -> list[tuple[str, i
 
     merged.sort(key=lambda item: item[1], reverse=True)
     return [("#{:02X}{:02X}{:02X}".format(*rgb), count) for rgb, count in merged]
+
+
+def merge_filament_color_counts(colors: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    merged: list[tuple[tuple[int, int, int], int]] = []
+    for hex_color, count in colors:
+        rgb = hex_to_rgb(hex_color)
+        for index, (existing, existing_count) in enumerate(merged):
+            if same_filament_tone(rgb, existing):
+                weight = existing_count + count
+                averaged = tuple(int((existing[i] * existing_count + rgb[i] * count) / weight) for i in range(3))
+                merged[index] = (averaged, weight)
+                break
+        else:
+            merged.append((rgb, count))
+    merged.sort(key=lambda item: item[1], reverse=True)
+    return [(representative_hex(rgb), count) for rgb, count in merged]
 
 
 def border_background_colors(pixels: list[tuple[int, int, int, int]], width: int, height: int) -> list[tuple[int, int, int]]:
@@ -365,6 +429,27 @@ def build_foreground_mask(
     return mask
 
 
+def refine_foreground_mask(mask: list[bool], width: int, height: int) -> list[bool]:
+    refined = mask[:]
+    for index, is_foreground in enumerate(mask):
+        if not is_foreground:
+            continue
+        x = index % width
+        y = index // width
+        neighbors = 0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx = x + dx
+                ny = y + dy
+                if 0 <= nx < width and 0 <= ny < height and mask[ny * width + nx]:
+                    neighbors += 1
+        if neighbors < 2:
+            refined[index] = False
+    return refined
+
+
 def component_score(component: list[int], width: int, height: int) -> float:
     center_x = (width - 1) / 2
     center_y = (height - 1) / 2
@@ -384,7 +469,29 @@ def component_score(component: list[int], width: int, height: int) -> float:
     return len(component) + center_bonus * 2 - distance * 8
 
 
-def select_printed_object_mask(mask: list[bool], width: int, height: int) -> set[int]:
+def component_bounds(component: list[int], width: int) -> tuple[int, int, int, int]:
+    xs = [index % width for index in component]
+    ys = [index // width for index in component]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def bounds_distance(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    dx = max(0, max(bx1 - ax2, ax1 - bx2))
+    dy = max(0, max(by1 - ay2, ay1 - by2))
+    return (dx**2 + dy**2) ** 0.5
+
+
+def components_are_separated(components: list[set[int]], width: int) -> bool:
+    for index, component in enumerate(components):
+        for other in components[index + 1 :]:
+            if bounds_distance(component_bounds(list(component), width), component_bounds(list(other), width)) <= 2:
+                return False
+    return True
+
+
+def extract_mask_components(mask: list[bool], width: int, height: int) -> list[list[int]]:
     visited = [False] * len(mask)
     components: list[list[int]] = []
     min_area = max(20, int(width * height * 0.004))
@@ -415,11 +522,205 @@ def select_printed_object_mask(mask: list[bool], width: int, height: int) -> set
                     stack.append(neighbor)
         if len(component) >= min_area:
             components.append(component)
+    return components
 
+
+def select_printed_object_mask(mask: list[bool], width: int, height: int) -> set[int]:
+    return set().union(*select_printed_object_components(mask, width, height))
+
+
+def select_printed_object_components(mask: list[bool], width: int, height: int) -> list[set[int]]:
+    components = extract_mask_components(mask, width, height)
     if not components:
-        return set()
+        return []
     chosen = max(components, key=lambda component: component_score(component, width, height))
-    return set(chosen)
+    chosen_bounds = component_bounds(chosen, width)
+    chosen_area = len(chosen)
+    selected = [set(chosen)]
+
+    for component in components:
+        if component is chosen:
+            continue
+        area = len(component)
+        if area < chosen_area * 0.12:
+            continue
+        score = component_score(component, width, height)
+        distance = bounds_distance(chosen_bounds, component_bounds(component, width))
+        is_near_primary = distance <= min(width, height) * 0.16
+        if is_near_primary:
+            selected.append(set(component))
+    return selected
+
+
+def assign_filament_cluster(
+    rgb: tuple[int, int, int],
+    clusters: list[tuple[tuple[int, int, int], int]],
+) -> int:
+    best_index = 0
+    best_distance = float("inf")
+    for index, (center, _) in enumerate(clusters):
+        if same_filament_tone(rgb, center):
+            return index
+        distance = color_distance(rgb, center)
+        if distance < best_distance:
+            best_index = index
+            best_distance = distance
+    return best_index
+
+
+def color_region_count(
+    cluster_index: int,
+    cluster_for_pixel: dict[int, int],
+    object_mask: set[int],
+    width: int,
+    min_region_size: int,
+) -> int:
+    remaining = {index for index, assigned in cluster_for_pixel.items() if assigned == cluster_index}
+    regions = 0
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        size = 0
+        while stack:
+            index = stack.pop()
+            size += 1
+            x = index % width
+            neighbors = []
+            if x > 0:
+                neighbors.append(index - 1)
+            if x < width - 1:
+                neighbors.append(index + 1)
+            neighbors.append(index - width)
+            neighbors.append(index + width)
+            for neighbor in neighbors:
+                if neighbor in remaining and neighbor in object_mask:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+        if size >= min_region_size:
+            regions += 1
+    return regions
+
+
+def boundary_edge_count(
+    cluster_index: int,
+    cluster_for_pixel: dict[int, int],
+    object_mask: set[int],
+    width: int,
+) -> int:
+    edges = 0
+    for index, assigned in cluster_for_pixel.items():
+        if assigned != cluster_index:
+            continue
+        x = index % width
+        neighbors = []
+        if x > 0:
+            neighbors.append(index - 1)
+        if x < width - 1:
+            neighbors.append(index + 1)
+        neighbors.append(index - width)
+        neighbors.append(index + width)
+        for neighbor in neighbors:
+            if neighbor in object_mask and cluster_for_pixel.get(neighbor) not in (None, cluster_index):
+                edges += 1
+    return edges
+
+
+def foreground_color_clusters(
+    pixels: list[tuple[int, int, int, int]],
+    object_mask: set[int],
+    width: int,
+) -> list[str]:
+    buckets: dict[str, int] = {}
+    for index in object_mask:
+        r, g, b, _ = pixels[index]
+        buckets[quantized_hex((r, g, b))] = buckets.get(quantized_hex((r, g, b)), 0) + 1
+    if not buckets:
+        return []
+
+    total = sum(buckets.values())
+    significant = [(color, count) for color, count in buckets.items() if count / total >= 0.008]
+    merged = merge_filament_color_counts(sorted(significant, key=lambda item: item[1], reverse=True)[:18])
+    if not merged:
+        return []
+
+    cluster_centers = [(hex_to_rgb(color), count) for color, count in merged]
+    cluster_for_pixel: dict[int, int] = {}
+    counts = [0] * len(cluster_centers)
+    for index in object_mask:
+        r, g, b, _ = pixels[index]
+        cluster_index = assign_filament_cluster((r, g, b), cluster_centers)
+        cluster_for_pixel[index] = cluster_index
+        counts[cluster_index] += 1
+
+    min_region_size = max(8, int(total * 0.018))
+    accepted: list[tuple[str, int]] = []
+    for index, (center, _) in enumerate(cluster_centers):
+        share = counts[index] / total
+        if share < 0.035:
+            continue
+        has_region = color_region_count(index, cluster_for_pixel, object_mask, width, min_region_size) > 0
+        if not has_region:
+            continue
+        if accepted:
+            boundaries = boundary_edge_count(index, cluster_for_pixel, object_mask, width)
+            if boundaries < max(6, int(counts[index] * 0.025)):
+                continue
+        accepted.append((representative_hex(center), counts[index]))
+
+    if not accepted:
+        return [representative_hex(cluster_centers[0][0])]
+    accepted.sort(key=lambda item: item[1], reverse=True)
+    colors = [color for color, _ in accepted[:5]]
+    has_high_contrast_neutral = any(
+        is_high_contrast_neutral_pair(hex_to_rgb(color), hex_to_rgb(other))
+        for index, color in enumerate(colors)
+        for other in colors[index + 1 :]
+    )
+    if not has_high_contrast_neutral and (looks_like_neutral_gradient(colors) or looks_like_single_hue_shading(colors)):
+        return [colors[0]]
+    return colors
+
+
+def dominant_component_color(
+    pixels: list[tuple[int, int, int, int]],
+    component: set[int],
+) -> str:
+    buckets: dict[str, int] = {}
+    for index in component:
+        r, g, b, _ = pixels[index]
+        color = quantized_hex((r, g, b))
+        buckets[color] = buckets.get(color, 0) + 1
+    merged = merge_filament_color_counts(sorted(buckets.items(), key=lambda item: item[1], reverse=True)[:12])
+    return merged[0][0] if merged else ""
+
+
+def looks_like_separate_single_color_versions(
+    pixels: list[tuple[int, int, int, int]],
+    components: list[set[int]],
+    width: int,
+) -> bool:
+    if len(components) < 2:
+        return False
+    significant = [component for component in components if len(component) >= 30]
+    if len(significant) < 2:
+        return False
+    if not components_are_separated(significant, width):
+        return False
+
+    single_color_components = 0
+    dominant_colors: list[str] = []
+    for component in significant:
+        colors = foreground_color_clusters(pixels, component, width)
+        if len(colors) <= 1:
+            single_color_components += 1
+            color = colors[0] if colors else dominant_component_color(pixels, component)
+            if color:
+                dominant_colors.append(color)
+
+    if single_color_components < 2 or single_color_components / len(significant) < 0.75:
+        return False
+    unique_colors = merge_filament_color_counts([(color, 1) for color in dominant_colors])
+    return len(unique_colors) >= 2
 
 
 def analyze_image_colors(image_data: bytes, sample_size: int = 180) -> list[str]:
@@ -436,35 +737,17 @@ def analyze_image_colors(image_data: bytes, sample_size: int = 180) -> list[str]
         pixels = list(pixel_source)
 
     backgrounds = border_background_colors(pixels, width, height)
-    object_mask = select_printed_object_mask(build_foreground_mask(pixels, width, height, backgrounds), width, height)
+    foreground_mask = refine_foreground_mask(build_foreground_mask(pixels, width, height, backgrounds), width, height)
+    all_components = [set(component) for component in extract_mask_components(foreground_mask, width, height)]
+    if looks_like_separate_single_color_versions(pixels, all_components, width):
+        largest_component = max(all_components, key=len)
+        color = dominant_component_color(pixels, largest_component)
+        return [color] if color else []
+    components = select_printed_object_components(foreground_mask, width, height)
+    object_mask = set().union(*components) if components else set()
     if not object_mask:
         return []
-
-    buckets: dict[str, int] = {}
-    for index in object_mask:
-        r, g, b, _ = pixels[index]
-        rgb = (r, g, b)
-        buckets[quantized_hex(rgb)] = buckets.get(quantized_hex(rgb), 0) + 1
-
-    if not buckets:
-        return []
-
-    total = sum(buckets.values())
-    significant = [(color, count) for color, count in buckets.items() if count / total >= 0.025]
-    merged = merge_close_color_counts(sorted(significant, key=lambda item: item[1], reverse=True)[:10])
-    if not merged:
-        return []
-
-    filtered = [(color, count) for color, count in merged if count / total >= 0.10]
-    if not filtered:
-        filtered = [merged[0]]
-    if len(filtered) > 1:
-        top_count = filtered[0][1]
-        filtered = [item for item in filtered if item[1] / top_count >= 0.28]
-    colors = [color for color, _ in filtered[:4]]
-    if looks_like_neutral_gradient(colors) or looks_like_single_hue_shading(colors):
-        return [colors[0]]
-    return colors
+    return foreground_color_clusters(pixels, object_mask, width)
 
 
 def classify_colors(
@@ -482,8 +765,10 @@ def classify_colors(
         failures = 0
         for url in image_urls[:image_limit]:
             try:
-                photo_colors = analyze_image_colors(http_bytes(url, delay=delay))
-                if photo_colors:
+                candidate_colors = analyze_image_colors(http_bytes(url, delay=delay))
+                if len(candidate_colors) > len(photo_colors):
+                    photo_colors = candidate_colors
+                if len(photo_colors) >= 2:
                     break
             except Exception as exc:
                 failures += 1
@@ -491,6 +776,8 @@ def classify_colors(
                 continue
         if photo_colors:
             if len(profile_colors) == 1 and looks_like_neutral_gradient(photo_colors):
+                return "single color", 1, [profile_colors[0]], "photo_analysis_profile_calibrated"
+            if len(profile_colors) == 1 and colors_are_muted_shading(photo_colors):
                 return "single color", 1, [profile_colors[0]], "photo_analysis_profile_calibrated"
             count = len(photo_colors)
             label = "multi color" if count > 1 else "single color"
@@ -548,10 +835,12 @@ def build_record(
 
 
 def write_json(records: Iterable[ModelRecord], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps([asdict(record) for record in records], ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def write_csv(records: Iterable[ModelRecord], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     rows = [asdict(record) for record in records]
     for row in rows:
         row["tags"] = "|".join(row["tags"])
@@ -605,6 +894,7 @@ def normalize_category(value: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scrape MakerWorld category root model metadata.")
+    today = date.today().isoformat()
     parser.add_argument("--pages", type=int, default=100, help="Feed pages to fetch per category. Default: 100.")
     parser.add_argument("--page-size", type=int, default=20, help="Models requested per feed page. Default: 20.")
     parser.add_argument(
@@ -617,8 +907,8 @@ def parse_args() -> argparse.Namespace:
             "Examples: art household toys_games 'Props & Cosplay'."
         ),
     )
-    parser.add_argument("--output", default="makerworld_models.json", help="JSON output path.")
-    parser.add_argument("--csv-output", default="makerworld_models.csv", help="CSV output path.")
+    parser.add_argument("--output", default=f"data/makerworld_models_{today}.json", help="JSON output path.")
+    parser.add_argument("--csv-output", default=f"data/makerworld_models_{today}.csv", help="CSV output path.")
     parser.add_argument("--delay", type=float, default=0.25, help="Delay between HTTP requests in seconds. Default: 0.25.")
     parser.add_argument("--image-limit", type=int, default=3, help="Images to analyze per model. Default: 3.")
     parser.add_argument("--no-image-analysis", action="store_true", help="Skip photo analysis and use print profile colors only.")
