@@ -122,15 +122,15 @@ Slow down requests:
 .venv/bin/python scraper.py --delay 0.5
 ```
 
-## Daily GitHub Actions Run
+## Manual GitHub Actions Run
 
-The repository includes `.github/workflows/daily-scrape.yml`, which runs the scraper once per day with image analysis disabled:
+The repository includes `.github/workflows/daily-scrape.yml`, which can be started manually from the GitHub Actions tab with image analysis disabled:
 
 ```bash
 python scraper.py --no-image-analysis --pages 100 --page-size 20
 ```
 
-The workflow runs at `08:15 UTC` every day and can also be started manually from the GitHub Actions tab with custom `pages` and `page_size` inputs.
+The workflow accepts custom `pages` and `page_size` inputs when started manually. It has no automatic schedule.
 
 Daily outputs are committed back into the repository under `data/`, such as:
 

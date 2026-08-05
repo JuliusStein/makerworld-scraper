@@ -1,8 +1,6 @@
-name: Daily MakerWorld Scrape
+name: MakerWorld Scrape
 
 on:
-  schedule:
-    - cron: "15 8 * * *"
   workflow_dispatch:
     inputs:
       pages:
